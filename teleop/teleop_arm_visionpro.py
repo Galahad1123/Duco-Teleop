@@ -199,7 +199,8 @@ def main():
             # target_pose = robot_origin_pose @ tele_rel_pose
             delta_world = current_tele_pose[:3, 3] - init_tele_pose[:3, 3]
             target_pose = robot_origin_pose.copy()
-            target_pose[:3, :3] = robot_origin_pose[:3, :3]   # 先冻结机器人末端朝向
+            # target_pose[:3, :3] = robot_origin_pose[:3, :3]   # 先冻结机器人末端朝向
+            target_pose[:3, :3] = current_tele_pose[:3, :3]  # hand_pose来自 compute_hand_pose
             target_pose[:3, 3] = robot_origin_pose[:3, 3] + delta_world
 
             logger_mp.debug(f"current tele xyz = {current_tele_pose[:3,3]}")
@@ -225,7 +226,13 @@ def main():
             logger_mp.error(f"Failed to go home: {e}")
         try:
             if args.ipc and ipc_server: ipc_server.stop()
-            else: stop_listening()
+            else: 
+                # stop_listening()
+                try:
+                    stop_listening()
+                    listen_keyboard_thread.join(timeout=1.0)
+                except Exception as e:
+                    logger_mp.warning(f"Keyboard listener already stopped: {e}")
         except Exception as e:
             logger_mp.error(f"Failed to stop keyboard listener: {e}")
         try:
