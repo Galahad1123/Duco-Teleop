@@ -51,6 +51,10 @@ def build_parser():
     parser.add_argument('--motion', action='store_true')
     parser.add_argument('--hand-side', type=str, choices=['left','right'], default='right')
     parser.add_argument('--verbose-stream', action='store_true')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Only subscribe robot state and run IK debug, do not publish arm commands')
+    parser.add_argument('--debug-print-every', type=int, default=10,
+                        help='Print IK debug information every N control loops')
     return parser
 
 def setup_input_listener(args):
@@ -119,12 +123,13 @@ def main():
         if args.sim:
             ChannelFactoryInitialize(1, networkInterface=args.network_interface)
         else:
-            ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+            # ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+            ChannelFactoryInitialize(0, networkInterface="enp0s31f6", peerAddress="10.188.223.119")
 
         ipc_server, listen_keyboard_thread = setup_input_listener(args)
 
         # 使用 Duco 版 hand_pose wrapper
-        tv_wrapper = VisionProTVWrapperDuco(ip="10.188.210.197", verbose=args.verbose_stream)
+        tv_wrapper = VisionProTVWrapperDuco(ip="10.188.211.82", verbose=args.verbose_stream)
 
         if not args.motion:
             motion_switcher = MotionSwitcher()
@@ -139,9 +144,14 @@ def main():
                            ee_frame_name="ee",
                            ee_offset_xyz=(0.0,0.0,0.0))
 
-        arm_ctrl = duco_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+        arm_ctrl = duco_ArmController(
+            motion_mode=args.motion,
+            simulation_mode=args.sim,
+            enable_command_stream=not args.dry_run,
+        )
 
-        obs_joint_deg = np.array([-5.2,-20.8,109.6,99.2,90.5,-12.1], dtype=np.float64)
+        # obs_joint_deg = np.array([-5.2,-20.8,109.6,99.2,90.5,-12.1], dtype=np.float64)
+        obs_joint_deg = np.array([-8.25,-23.15,121.49,82.65,81.61,4.47], dtype=np.float64)
         obs_joint_rad = np.deg2rad(obs_joint_deg)
         robot_origin_pose = arm_ik.fk(obs_joint_rad)
         logger_mp.info(f"robot_origin_pose from obs_joint:\n{robot_origin_pose}")
@@ -182,6 +192,7 @@ def main():
         logger_mp.info("---------------------🚀 start Tracking 🚀------------------------")
         arm_ctrl.speed_gradual_max()
 
+        loop_count = 0
         while not STOP:
             loop_start = time.time()
             tele_data = tv_wrapper.get_tele_data()
@@ -207,7 +218,26 @@ def main():
             logger_mp.debug(f"target xyz = {target_pose[:3,3]}")
 
             sol_q, sol_tauff = arm_ik.solve_ik(target_pose, current_arm_q, current_arm_dq)
-            arm_ctrl.ctrl_arm(sol_q, sol_tauff)
+            solved_pose = arm_ik.fk(sol_q)
+
+            if loop_count % max(args.debug_print_every, 1) == 0:
+                pose_error_xyz = solved_pose[:3, 3] - target_pose[:3, 3]
+                rot_trace = np.trace(solved_pose[:3, :3] @ target_pose[:3, :3].T)
+                rot_trace = np.clip((rot_trace - 1.0) / 2.0, -1.0, 1.0)
+                pose_error_angle = float(np.arccos(rot_trace))
+
+                logger_mp.info(f"[teleop_arm_visionpro] current_arm_q: {np.array2string(current_arm_q, precision=5, suppress_small=True)}")
+                logger_mp.info(f"[teleop_arm_visionpro] current_arm_dq: {np.array2string(current_arm_dq, precision=5, suppress_small=True)}")
+                logger_mp.info(f"[teleop_arm_visionpro] sol_q: {np.array2string(sol_q, precision=5, suppress_small=True)}")
+                logger_mp.info(f"[teleop_arm_visionpro] sol_tauff: {np.array2string(sol_tauff, precision=5, suppress_small=True)}")
+                logger_mp.info(f"[teleop_arm_visionpro] target_pose xyz: {np.array2string(target_pose[:3,3], precision=5, suppress_small=True)}")
+                logger_mp.info(f"[teleop_arm_visionpro] fk(sol_q) xyz: {np.array2string(solved_pose[:3,3], precision=5, suppress_small=True)}")
+                logger_mp.info(f"[teleop_arm_visionpro] fk pose error xyz: {np.array2string(pose_error_xyz, precision=6, suppress_small=True)}, angle(rad): {pose_error_angle:.6f}")
+
+            if not args.dry_run:
+                arm_ctrl.ctrl_arm(sol_q, sol_tauff)
+
+            loop_count += 1
 
             elapsed = time.time() - loop_start
             sleep_time = max(0.0, (1.0/args.frequency) - elapsed)

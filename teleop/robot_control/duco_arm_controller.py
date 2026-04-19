@@ -65,11 +65,17 @@ class duco_ArmController:
     3. 先优先支持仿真链路：rt/lowstate <-> rt/lowcmd
     """
 
-    def __init__(self, motion_mode: bool = False, simulation_mode: bool = False):
+    def __init__(
+        self,
+        motion_mode: bool = False,
+        simulation_mode: bool = False,
+        enable_command_stream: bool = True,
+    ):
         logger_mp.info("Initialize duco_ArmController...")
 
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
+        self.enable_command_stream = enable_command_stream
 
         # 控制目标
         self.q_target = np.zeros(ARM_DOF, dtype=np.float64)
@@ -104,8 +110,10 @@ class duco_ArmController:
         else:
             topic_cmd = kTopicLowCommand_Motion if self.motion_mode else kTopicLowCommand_Debug
 
-        self.lowcmd_publisher = ChannelPublisher(topic_cmd, hg_LowCmd)
-        self.lowcmd_publisher.Init()
+        self.lowcmd_publisher = None
+        if self.enable_command_stream:
+            self.lowcmd_publisher = ChannelPublisher(topic_cmd, hg_LowCmd)
+            self.lowcmd_publisher.Init()
 
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
@@ -135,10 +143,13 @@ class duco_ArmController:
         self._init_joint_command_from_current_state(current_q)
 
         # 启动控制发送线程
-        self.publish_thread = threading.Thread(target=self._ctrl_motor_state, daemon=True)
-        self.publish_thread.start()
+        self.publish_thread = None
+        if self.enable_command_stream:
+            self.publish_thread = threading.Thread(target=self._ctrl_motor_state, daemon=True)
+            self.publish_thread.start()
 
         logger_mp.info(f"[duco_ArmController] DDS command topic: {topic_cmd}")
+        logger_mp.info(f"[duco_ArmController] DDS command stream enabled: {self.enable_command_stream}")
         logger_mp.info("Initialize duco_ArmController OK!")
 
     # -----------------------------------------------------------------
@@ -221,8 +232,9 @@ class duco_ArmController:
                 self.msg.motor_cmd[i].dq = 0.0
                 self.msg.motor_cmd[i].tau = float(arm_tauff_target[i])
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.lowcmd_publisher is not None:
+                self.msg.crc = self.crc.Crc(self.msg)
+                self.lowcmd_publisher.Write(self.msg)
 
             # 启动阶段逐渐增加速度上限
             if self._speed_gradual_max and self._gradual_start_time is not None:
