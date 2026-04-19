@@ -53,6 +53,8 @@ def build_parser():
     parser.add_argument('--verbose-stream', action='store_true')
     parser.add_argument('--orientation-mode', type=str, choices=['fixed', 'teleop'], default='fixed',
                         help='fixed: only track position delta; teleop: track both position and wrist orientation')
+    parser.add_argument('--position-scale', type=float, default=1.0,
+                        help='Scale factor for teleop translation delta. Values < 1.0 reduce motion range.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Only subscribe robot state and run IK debug, do not publish arm commands')
     parser.add_argument('--debug-print-every', type=int, default=10,
@@ -125,8 +127,7 @@ def main():
         if args.sim:
             ChannelFactoryInitialize(1, networkInterface=args.network_interface)
         else:
-            # ChannelFactoryInitialize(0, networkInterface=args.network_interface)
-            ChannelFactoryInitialize(0, networkInterface="enp0s31f6", peerAddress="10.188.223.119")
+            ChannelFactoryInitialize(0, networkInterface="enp0s31f6", peerAddress="10.188.223.119") # 不要修改
 
         ipc_server, listen_keyboard_thread = setup_input_listener(args)
 
@@ -193,6 +194,7 @@ def main():
 
         logger_mp.info("---------------------🚀 start Tracking 🚀------------------------")
         logger_mp.info(f"Orientation mode: {args.orientation_mode}")
+        logger_mp.info(f"Position scale: {args.position_scale}")
         arm_ctrl.speed_gradual_max()
 
         loop_count = 0
@@ -211,7 +213,7 @@ def main():
             # 相对移动
             # tele_rel_pose = tele_origin_inv @ current_tele_pose
             # target_pose = robot_origin_pose @ tele_rel_pose
-            delta_world = current_tele_pose[:3, 3] - init_tele_pose[:3, 3]
+            delta_world = (current_tele_pose[:3, 3] - init_tele_pose[:3, 3]) * args.position_scale
             target_pose = robot_origin_pose.copy()
             # target_pose[:3, :3] = robot_origin_pose[:3, :3]   # 先冻结机器人末端朝向
             if args.orientation_mode == 'teleop':
