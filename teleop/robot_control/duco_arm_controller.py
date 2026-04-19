@@ -28,6 +28,8 @@ kTopicLowState = "rt/lowstate"
 ARM_DOF = 6
 ALL_MOTOR_NUM = 6
 CONTROL_DT = 1.0 / 250.0
+DUCO_HOME_Q_DEG = np.array([-8.25, -23.15, 121.49, 82.65, 81.61, 4.47], dtype=np.float64)
+DUCO_HOME_Q_RAD = np.deg2rad(DUCO_HOME_Q_DEG)
 
 
 @dataclass
@@ -302,13 +304,18 @@ class duco_ArmController:
         max_attempts = 100
         tolerance = 0.05
 
+        if self.simulation_mode:
+            home_q = np.zeros(ARM_DOF, dtype=np.float64)
+        else:
+            home_q = DUCO_HOME_Q_RAD.copy()
+
         with self.ctrl_lock:
-            self.q_target = np.zeros(ARM_DOF, dtype=np.float64)
+            self.q_target = home_q
             self.tauff_target = np.zeros(ARM_DOF, dtype=np.float64)
 
         for _ in range(max_attempts):
             current_q = self.get_current_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - home_q) < tolerance):
                 logger_mp.info("[duco_ArmController] arm has reached the home position.")
                 return
             time.sleep(0.05)

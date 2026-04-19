@@ -51,6 +51,8 @@ def build_parser():
     parser.add_argument('--motion', action='store_true')
     parser.add_argument('--hand-side', type=str, choices=['left','right'], default='right')
     parser.add_argument('--verbose-stream', action='store_true')
+    parser.add_argument('--orientation-mode', type=str, choices=['fixed', 'teleop'], default='fixed',
+                        help='fixed: only track position delta; teleop: track both position and wrist orientation')
     parser.add_argument('--dry-run', action='store_true',
                         help='Only subscribe robot state and run IK debug, do not publish arm commands')
     parser.add_argument('--debug-print-every', type=int, default=10,
@@ -190,6 +192,7 @@ def main():
         logger_mp.info("Relative teleop origin initialized.")
 
         logger_mp.info("---------------------🚀 start Tracking 🚀------------------------")
+        logger_mp.info(f"Orientation mode: {args.orientation_mode}")
         arm_ctrl.speed_gradual_max()
 
         loop_count = 0
@@ -211,7 +214,10 @@ def main():
             delta_world = current_tele_pose[:3, 3] - init_tele_pose[:3, 3]
             target_pose = robot_origin_pose.copy()
             # target_pose[:3, :3] = robot_origin_pose[:3, :3]   # 先冻结机器人末端朝向
-            target_pose[:3, :3] = current_tele_pose[:3, :3]  # hand_pose来自 compute_hand_pose
+            if args.orientation_mode == 'teleop':
+                target_pose[:3, :3] = current_tele_pose[:3, :3]
+            else:
+                target_pose[:3, :3] = robot_origin_pose[:3, :3]
             target_pose[:3, 3] = robot_origin_pose[:3, 3] + delta_world
 
             logger_mp.debug(f"current tele xyz = {current_tele_pose[:3,3]}")
@@ -226,13 +232,13 @@ def main():
                 rot_trace = np.clip((rot_trace - 1.0) / 2.0, -1.0, 1.0)
                 pose_error_angle = float(np.arccos(rot_trace))
 
-                logger_mp.info(f"[teleop_arm_visionpro] current_arm_q: {np.array2string(current_arm_q, precision=5, suppress_small=True)}")
-                logger_mp.info(f"[teleop_arm_visionpro] current_arm_dq: {np.array2string(current_arm_dq, precision=5, suppress_small=True)}")
-                logger_mp.info(f"[teleop_arm_visionpro] sol_q: {np.array2string(sol_q, precision=5, suppress_small=True)}")
-                logger_mp.info(f"[teleop_arm_visionpro] sol_tauff: {np.array2string(sol_tauff, precision=5, suppress_small=True)}")
+                logger_mp.debug(f"[teleop_arm_visionpro] current_arm_q: {np.array2string(current_arm_q, precision=5, suppress_small=True)}")
+                logger_mp.debug(f"[teleop_arm_visionpro] current_arm_dq: {np.array2string(current_arm_dq, precision=5, suppress_small=True)}")
+                logger_mp.debug(f"[teleop_arm_visionpro] sol_q: {np.array2string(sol_q, precision=5, suppress_small=True)}")
+                logger_mp.debug(f"[teleop_arm_visionpro] sol_tauff: {np.array2string(sol_tauff, precision=5, suppress_small=True)}")
                 logger_mp.info(f"[teleop_arm_visionpro] target_pose xyz: {np.array2string(target_pose[:3,3], precision=5, suppress_small=True)}")
-                logger_mp.info(f"[teleop_arm_visionpro] fk(sol_q) xyz: {np.array2string(solved_pose[:3,3], precision=5, suppress_small=True)}")
-                logger_mp.info(f"[teleop_arm_visionpro] fk pose error xyz: {np.array2string(pose_error_xyz, precision=6, suppress_small=True)}, angle(rad): {pose_error_angle:.6f}")
+                logger_mp.debug(f"[teleop_arm_visionpro] fk(sol_q) xyz: {np.array2string(solved_pose[:3,3], precision=5, suppress_small=True)}")
+                logger_mp.debug(f"[teleop_arm_visionpro] fk pose error xyz: {np.array2string(pose_error_xyz, precision=6, suppress_small=True)}, angle(rad): {pose_error_angle:.6f}")
 
             if not args.dry_run:
                 arm_ctrl.ctrl_arm(sol_q, sol_tauff)
