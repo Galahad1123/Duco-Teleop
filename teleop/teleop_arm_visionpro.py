@@ -55,6 +55,16 @@ def build_parser():
                         help='fixed: only track position delta; teleop: track both position and wrist orientation')
     parser.add_argument('--position-scale', type=float, default=1.0,
                         help='Scale factor for teleop translation delta. Values < 1.0 reduce motion range.')
+    parser.add_argument('--orientation-scale', type=float, default=1.0,
+                        help='Scale factor for teleop rotation delta. Values < 1.0 reduce rotation range.')
+    parser.add_argument('--orientation-scale-rx', type=float, default=1.0,
+                        help='Per-axis scale/sign for rotation vector x component.')
+    parser.add_argument('--orientation-scale-ry', type=float, default=1.0,
+                        help='Per-axis scale/sign for rotation vector y component.')
+    parser.add_argument('--orientation-scale-rz', type=float, default=1.0,
+                        help='Per-axis scale/sign for rotation vector z component.')
+    parser.add_argument('--ik-translation-fallback-threshold', type=float, default=0.02,
+                        help='If full pose IK translation error exceeds this threshold (m), fallback to position-priority target.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Only subscribe robot state and run IK debug, do not publish arm commands')
     parser.add_argument('--debug-print-every', type=int, default=10,
@@ -109,6 +119,57 @@ def fast_mat_inv(mat):
     ret[:3, :3] = mat[:3, :3].T
     ret[:3, 3] = -mat[:3, :3].T @ mat[:3, 3]
     return ret
+
+
+def skew(v):
+    x, y, z = np.asarray(v, dtype=np.float64).reshape(3)
+    return np.array([
+        [0.0, -z, y],
+        [z, 0.0, -x],
+        [-y, x, 0.0],
+    ], dtype=np.float64)
+
+
+def rotation_matrix_to_rotvec(rot):
+    rot = np.asarray(rot, dtype=np.float64).reshape(3, 3)
+    cos_theta = np.clip((np.trace(rot) - 1.0) * 0.5, -1.0, 1.0)
+    theta = float(np.arccos(cos_theta))
+
+    if theta < 1e-8:
+        return np.zeros(3, dtype=np.float64)
+
+    sin_theta = np.sin(theta)
+    if abs(sin_theta) < 1e-6:
+        axis = np.sqrt(np.maximum((np.diag(rot) + 1.0) * 0.5, 0.0))
+        if rot[2, 1] - rot[1, 2] < 0.0:
+            axis[0] = -axis[0]
+        if rot[0, 2] - rot[2, 0] < 0.0:
+            axis[1] = -axis[1]
+        if rot[1, 0] - rot[0, 1] < 0.0:
+            axis[2] = -axis[2]
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-8:
+            return np.zeros(3, dtype=np.float64)
+        axis /= axis_norm
+        return axis * theta
+
+    axis = np.array([
+        rot[2, 1] - rot[1, 2],
+        rot[0, 2] - rot[2, 0],
+        rot[1, 0] - rot[0, 1],
+    ], dtype=np.float64) / (2.0 * sin_theta)
+    return axis * theta
+
+
+def rotvec_to_rotation_matrix(rotvec):
+    rotvec = np.asarray(rotvec, dtype=np.float64).reshape(3)
+    theta = np.linalg.norm(rotvec)
+    if theta < 1e-8:
+        return np.eye(3, dtype=np.float64)
+
+    axis = rotvec / theta
+    k = skew(axis)
+    return np.eye(3, dtype=np.float64) + np.sin(theta) * k + (1.0 - np.cos(theta)) * (k @ k)
 
 def main():
     global READY, START, STOP
@@ -195,6 +256,14 @@ def main():
         logger_mp.info("---------------------🚀 start Tracking 🚀------------------------")
         logger_mp.info(f"Orientation mode: {args.orientation_mode}")
         logger_mp.info(f"Position scale: {args.position_scale}")
+        logger_mp.info(f"Orientation scale: {args.orientation_scale}")
+        logger_mp.info(
+            "Orientation axis scales: rx=%s ry=%s rz=%s",
+            args.orientation_scale_rx,
+            args.orientation_scale_ry,
+            args.orientation_scale_rz,
+        )
+        logger_mp.info(f"IK translation fallback threshold: {args.ik_translation_fallback_threshold}")
         arm_ctrl.speed_gradual_max()
 
         loop_count = 0
@@ -213,11 +282,23 @@ def main():
             # 相对移动
             # tele_rel_pose = tele_origin_inv @ current_tele_pose
             # target_pose = robot_origin_pose @ tele_rel_pose
+            tele_rel_pose = tele_origin_inv @ current_tele_pose
             delta_world = (current_tele_pose[:3, 3] - init_tele_pose[:3, 3]) * args.position_scale
             target_pose = robot_origin_pose.copy()
             # target_pose[:3, :3] = robot_origin_pose[:3, :3]   # 先冻结机器人末端朝向
             if args.orientation_mode == 'teleop':
-                target_pose[:3, :3] = current_tele_pose[:3, :3]
+                rel_rot = tele_rel_pose[:3, :3]
+                rel_rotvec = rotation_matrix_to_rotvec(rel_rot) * args.orientation_scale
+                rel_rotvec = rel_rotvec * np.array(
+                    [
+                        args.orientation_scale_rx,
+                        args.orientation_scale_ry,
+                        args.orientation_scale_rz,
+                    ],
+                    dtype=np.float64,
+                )
+                scaled_rel_rot = rotvec_to_rotation_matrix(rel_rotvec)
+                target_pose[:3, :3] = robot_origin_pose[:3, :3] @ scaled_rel_rot
             else:
                 target_pose[:3, :3] = robot_origin_pose[:3, :3]
             target_pose[:3, 3] = robot_origin_pose[:3, 3] + delta_world
@@ -227,6 +308,32 @@ def main():
 
             sol_q, sol_tauff = arm_ik.solve_ik(target_pose, current_arm_q, current_arm_dq)
             solved_pose = arm_ik.fk(sol_q)
+
+            if args.orientation_mode == 'teleop':
+                pos_error_norm = float(np.linalg.norm(solved_pose[:3, 3] - target_pose[:3, 3]))
+                if pos_error_norm > args.ik_translation_fallback_threshold:
+                    target_pose_pos_only = target_pose.copy()
+                    target_pose_pos_only[:3, :3] = robot_origin_pose[:3, :3]
+                    fallback_q, fallback_tauff = arm_ik.solve_ik(
+                        target_pose_pos_only,
+                        current_arm_q,
+                        current_arm_dq,
+                    )
+                    fallback_pose = arm_ik.fk(fallback_q)
+                    fallback_pos_error_norm = float(
+                        np.linalg.norm(fallback_pose[:3, 3] - target_pose_pos_only[:3, 3])
+                    )
+
+                    if fallback_pos_error_norm < pos_error_norm:
+                        logger_mp.warning(
+                            "[teleop_arm_visionpro] Full-pose IK translation error %.4fm too large; "
+                            "fallback to position-priority IK (error %.4fm).",
+                            pos_error_norm,
+                            fallback_pos_error_norm,
+                        )
+                        sol_q = fallback_q
+                        sol_tauff = fallback_tauff
+                        solved_pose = fallback_pose
 
             if loop_count % max(args.debug_print_every, 1) == 0:
                 pose_error_xyz = solved_pose[:3, 3] - target_pose[:3, 3]
