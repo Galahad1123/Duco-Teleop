@@ -72,7 +72,7 @@ def build_parser():
     parser.add_argument(
         "--position-scale",
         type=float,
-        default=0.6,
+        default=0.8,
         help="Scale factor for teleop translation delta.",
     )
     parser.add_argument(
@@ -175,6 +175,24 @@ def get_target_pose(tele_data, hand_side: str):
     return tele_data.left_wrist_pose if hand_side == "left" else tele_data.right_wrist_pose
 
 
+def get_gripper_status(tele_data, hand_side: str):
+    if tele_data is None:
+        return None, None, None
+
+    if hand_side == "left":
+        return (
+            getattr(tele_data, "left_hand_pinch", None),
+            getattr(tele_data, "left_hand_pinchValue", None),
+            getattr(tele_data, "left_hand_pinchNormalized", None),
+        )
+
+    return (
+        getattr(tele_data, "right_hand_pinch", None),
+        getattr(tele_data, "right_hand_pinchValue", None),
+        getattr(tele_data, "right_hand_pinchNormalized", None),
+    )
+
+
 def wait_for_valid_pose(tv_wrapper, hand_side: str, timeout_sec: float = 10.0):
     deadline = time.time() + timeout_sec
     while time.time() < deadline and not STOP:
@@ -258,7 +276,15 @@ def rotvec_to_rotation_matrix(rotvec):
 
 def build_target_pose(args, robot_origin_pose, init_tele_pose, tele_origin_inv, current_tele_pose):
     tele_rel_pose = tele_origin_inv @ current_tele_pose
-    delta_world = (current_tele_pose[:3, 3] - init_tele_pose[:3, 3]) * args.position_scale
+    raw_delta_world = (current_tele_pose[:3, 3] - init_tele_pose[:3, 3]) * args.position_scale
+
+    # Align hand translation with the robot base plane:
+    # teleop lateral motion -> robot lateral motion
+    # teleop forward/back motion -> robot forward/back motion
+    delta_world = np.array(
+        [raw_delta_world[1], -raw_delta_world[0], raw_delta_world[2]],
+        dtype=np.float64,
+    )
 
     target_pose = robot_origin_pose.copy()
     target_pose[:3, 3] = robot_origin_pose[:3, 3] + delta_world
@@ -423,6 +449,7 @@ def main():
                 time.sleep(0.01)
                 continue
 
+            _, _, pinch_normalized = get_gripper_status(tele_data, args.hand_side)
             current_arm_q = arm_ctrl.get_current_arm_q()
             current_arm_dq = arm_ctrl.get_current_arm_dq()
             target_pose = build_target_pose(
@@ -440,7 +467,7 @@ def main():
                 current_arm_dq,
                 target_pose,
             )
-            arm_ctrl.ctrl_arm(sol_q, sol_tauff)
+            arm_ctrl.ctrl_arm(sol_q, sol_tauff, gripper_target=pinch_normalized)
 
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, (1.0 / args.frequency) - elapsed))

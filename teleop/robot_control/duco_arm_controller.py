@@ -1,5 +1,6 @@
 import time
 import threading
+import struct
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -30,6 +31,7 @@ ALL_MOTOR_NUM = 6
 CONTROL_DT = 1.0 / 250.0
 DUCO_HOME_Q_DEG = np.array([-8.25, -23.15, 121.49, 82.65, 81.61, 4.47], dtype=np.float64)
 DUCO_HOME_Q_RAD = np.deg2rad(DUCO_HOME_Q_DEG)
+GRIPPER_RESERVE_INDEX = 0
 
 
 @dataclass
@@ -82,6 +84,7 @@ class duco_ArmController:
         # 控制目标
         self.q_target = np.zeros(ARM_DOF, dtype=np.float64)
         self.tauff_target = np.zeros(ARM_DOF, dtype=np.float64)
+        self.gripper_target = 0.0
 
         # 控制参数
         self.kp_arm = 80.0
@@ -126,6 +129,7 @@ class duco_ArmController:
         # 这两个字段在 hg_LowCmd 里常见，沿用官方写法
         self.msg.mode_pr = 0
         self.msg.mode_machine = 0
+        self.msg.reserve[GRIPPER_RESERVE_INDEX] = self._encode_gripper_target(self.gripper_target)
 
         # 启动状态订阅线程
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state, daemon=True)
@@ -196,6 +200,11 @@ class duco_ArmController:
             self.msg.motor_cmd[i].dq = 0.0
             self.msg.motor_cmd[i].tau = 0.0
 
+    @staticmethod
+    def _encode_gripper_target(gripper_target: float) -> int:
+        gripper_target = float(np.clip(gripper_target, 0.0, 1.0))
+        return struct.unpack("<I", struct.pack("<f", gripper_target))[0]
+
     # -----------------------------------------------------------------
     # 限速逻辑
     # -----------------------------------------------------------------
@@ -219,6 +228,7 @@ class duco_ArmController:
             with self.ctrl_lock:
                 arm_q_target = self.q_target.copy()
                 arm_tauff_target = self.tauff_target.copy()
+                gripper_target = float(self.gripper_target)
 
             # 仿真里可直接发送；真机建议限速
             if self.simulation_mode:
@@ -233,6 +243,8 @@ class duco_ArmController:
                 self.msg.motor_cmd[i].q = float(clipped_arm_q_target[i])
                 self.msg.motor_cmd[i].dq = 0.0
                 self.msg.motor_cmd[i].tau = float(arm_tauff_target[i])
+
+            self.msg.reserve[GRIPPER_RESERVE_INDEX] = self._encode_gripper_target(gripper_target)
 
             if self.lowcmd_publisher is not None:
                 self.msg.crc = self.crc.Crc(self.msg)
@@ -271,7 +283,12 @@ class duco_ArmController:
     # -----------------------------------------------------------------
     # 控制接口：与 teleop_arm.py / duco_arm_ik.py 对齐
     # -----------------------------------------------------------------
-    def ctrl_arm(self, q_target: Sequence[float], tauff_target: Optional[Sequence[float]] = None):
+    def ctrl_arm(
+        self,
+        q_target: Sequence[float],
+        tauff_target: Optional[Sequence[float]] = None,
+        gripper_target: Optional[float] = None,
+    ):
         q_target = np.asarray(q_target, dtype=np.float64).reshape(-1)
         if q_target.shape[0] != ARM_DOF:
             raise ValueError(f"q_target shape mismatch: expect {ARM_DOF}, got {q_target.shape[0]}")
@@ -284,9 +301,14 @@ class duco_ArmController:
         if tauff_target.shape[0] != ARM_DOF:
             raise ValueError(f"tauff_target shape mismatch: expect {ARM_DOF}, got {tauff_target.shape[0]}")
 
+        if gripper_target is None:
+            gripper_target = self.gripper_target
+        gripper_target = float(np.clip(gripper_target, 0.0, 1.0))
+
         with self.ctrl_lock:
             self.q_target = q_target.copy()
             self.tauff_target = tauff_target.copy()
+            self.gripper_target = gripper_target
 
     # -----------------------------------------------------------------
     # 启停辅助
