@@ -32,10 +32,6 @@ CONTROL_DT = 1.0 / 250.0
 DUCO_HOME_Q_DEG = np.array([-8.25, -23.15, 121.49, 82.65, 81.61, 4.47], dtype=np.float64)
 DUCO_HOME_Q_RAD = np.deg2rad(DUCO_HOME_Q_DEG)
 GRIPPER_RESERVE_INDEX = 0
-RECORD_CMD_RESERVE_INDEX = 1
-RECORD_CMD_NOOP = 0
-RECORD_CMD_PREVIEW = 6
-RECORD_CMD_HOLD_CYCLES = 25
 
 
 @dataclass
@@ -90,9 +86,6 @@ class duco_ArmController:
         self.q_target = np.zeros(ARM_DOF, dtype=np.float64)
         self.tauff_target = np.zeros(ARM_DOF, dtype=np.float64)
         self.gripper_target = 0.0
-        self.pending_record_cmd = RECORD_CMD_NOOP
-        self.active_record_cmd = RECORD_CMD_NOOP
-        self.record_cmd_hold_remaining = 0
 
         # 控制参数
         self.kp_arm = 80.0
@@ -138,7 +131,6 @@ class duco_ArmController:
         self.msg.mode_pr = 0
         self.msg.mode_machine = 0
         self.msg.reserve[GRIPPER_RESERVE_INDEX] = self._encode_gripper_target(self.gripper_target)
-        self.msg.reserve[RECORD_CMD_RESERVE_INDEX] = RECORD_CMD_NOOP
 
         # 启动状态订阅线程
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state, daemon=True)
@@ -242,15 +234,6 @@ class duco_ArmController:
                 arm_q_target = self.q_target.copy()
                 arm_tauff_target = self.tauff_target.copy()
                 gripper_target = float(self.gripper_target)
-                if self.pending_record_cmd != RECORD_CMD_NOOP:
-                    self.active_record_cmd = int(self.pending_record_cmd)
-                    self.record_cmd_hold_remaining = RECORD_CMD_HOLD_CYCLES
-                    self.pending_record_cmd = RECORD_CMD_NOOP
-                record_cmd = int(self.active_record_cmd)
-                if self.record_cmd_hold_remaining > 0:
-                    self.record_cmd_hold_remaining -= 1
-                else:
-                    self.active_record_cmd = RECORD_CMD_NOOP
 
             # 仿真里可直接发送；真机建议限速
             if self.simulation_mode:
@@ -267,7 +250,6 @@ class duco_ArmController:
                 self.msg.motor_cmd[i].tau = float(arm_tauff_target[i])
 
             self.msg.reserve[GRIPPER_RESERVE_INDEX] = self._encode_gripper_target(gripper_target)
-            self.msg.reserve[RECORD_CMD_RESERVE_INDEX] = int(record_cmd)
 
             if self.lowcmd_publisher is not None:
                 self.msg.crc = self.crc.Crc(self.msg)
@@ -303,12 +285,6 @@ class duco_ArmController:
     def get_current_motor_q(self) -> np.ndarray:
         return self.get_current_arm_q()
 
-    def get_record_status_payload(self):
-        data = self.lowstate_buffer.get_data()
-        if data is None:
-            return None
-        return list(getattr(data, "reserve", [0, 0, 0, 0]))
-
     # -----------------------------------------------------------------
     # 控制接口：与 teleop_arm.py / duco_arm_ik.py 对齐
     # -----------------------------------------------------------------
@@ -317,7 +293,6 @@ class duco_ArmController:
         q_target: Sequence[float],
         tauff_target: Optional[Sequence[float]] = None,
         gripper_target: Optional[float] = None,
-        record_cmd: int = RECORD_CMD_NOOP,
     ):
         q_target = np.asarray(q_target, dtype=np.float64).reshape(-1)
         if q_target.shape[0] != ARM_DOF:
@@ -339,15 +314,6 @@ class duco_ArmController:
             self.q_target = q_target.copy()
             self.tauff_target = tauff_target.copy()
             self.gripper_target = gripper_target
-            if int(record_cmd) != RECORD_CMD_NOOP:
-                self.pending_record_cmd = int(record_cmd)
-
-    def set_record_command(self, record_cmd: int):
-        record_cmd = int(record_cmd)
-        if record_cmd == RECORD_CMD_NOOP:
-            return
-        with self.ctrl_lock:
-            self.pending_record_cmd = record_cmd
 
     # -----------------------------------------------------------------
     # 启停辅助

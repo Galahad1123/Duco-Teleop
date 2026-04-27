@@ -1,6 +1,7 @@
 import argparse
 from collections import deque
 import os
+import socket
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from sshkeyboard import listen_keyboard, stop_listening
 from televuer import VisionProTVWrapperDuco
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
+from record_zmq import RecordCmdClient
 from teleop.robot_control.duco_arm_controller import duco_ArmController
 from teleop.robot_control.duco_arm_ik import DucoArmIK
 from teleop.utils.ipc import IPC_Server
@@ -40,7 +42,6 @@ RECORD_CMD_DISCARD = 3
 RECORD_CMD_SKIP_RESET = 4
 RECORD_CMD_ABORT = 5
 RECORD_CMD_PREVIEW = 6
-RECORD_STATUS_MAGIC = 0x41565052
 RECORD_EVENT_PREVIEW = 1
 RECORD_EVENT_STARTED = 2
 RECORD_EVENT_KEPT = 3
@@ -49,10 +50,9 @@ RECORD_EVENT_RESET_SKIPPED = 5
 RECORD_EVENT_ABORTED = 6
 RECORD_EVENT_TARGET_REACHED = 7
 
-LAST_RECORD_STATUS_SEQ = None
-
 REAL_CHANNEL_INTERFACE = "enp0s31f6"
 REAL_CHANNEL_PEER_ADDRESS = "10.188.223.119"
+CTRL_HOST = REAL_CHANNEL_PEER_ADDRESS
 VISION_PRO_IP = "10.188.215.239"
 DUCO_URDF_PATH = "/home/yofo/unitree/duco_support/urdf/duco_gcr5_910.urdf"
 DUCO_HOME_Q_DEG = np.array([-8.25, -23.15, 121.49, 82.65, 81.61, 4.47], dtype=np.float64)
@@ -101,51 +101,19 @@ def get_state() -> dict:
     return {"START": START, "STOP": STOP, "READY": READY}
 
 
-def _decode_record_status_counts(raw_counts: int):
-    command_samples = int(raw_counts) & 0xFFF
-    robot_states = (int(raw_counts) >> 12) & 0x3FF
-    camera_frames = (int(raw_counts) >> 22) & 0x3FF
-    return command_samples, robot_states, camera_frames
+def _drain_record_status(record_client: RecordCmdClient):
+    while True:
+        status = record_client.recv_status()
+        if status is None:
+            break
+        _log_record_status(status)
 
 
-def decode_record_status_payload(payload):
-    if payload is None or len(payload) < 4:
-        return None
-    if int(payload[0]) != RECORD_STATUS_MAGIC:
-        return None
-
-    header = int(payload[1])
-    if header == 0:
-        return None
-
-    progress = int(payload[2])
-    command_samples, robot_states, camera_frames = _decode_record_status_counts(payload[3])
-    return {
-        "seq": (header >> 16) & 0xFFFF,
-        "event": (header >> 8) & 0xFF,
-        "state": header & 0xFF,
-        "episode": (progress >> 16) & 0xFFFF,
-        "saved": (progress >> 8) & 0xFF,
-        "target": progress & 0xFF,
-        "command_samples": command_samples,
-        "robot_states": robot_states,
-        "camera_frames": camera_frames,
-    }
-
-
-def log_record_status_if_updated(arm_ctrl):
-    global LAST_RECORD_STATUS_SEQ
-    if arm_ctrl is None:
-        return
-    status = decode_record_status_payload(arm_ctrl.get_record_status_payload())
-    if status is None or status["seq"] == LAST_RECORD_STATUS_SEQ:
-        return
-    LAST_RECORD_STATUS_SEQ = status["seq"]
-
-    event = status["event"]
-    episode = status["episode"]
-    saved = status["saved"]
-    target = status["target"]
+def _log_record_status(status: dict):
+    event = status.get("event")
+    episode = int(status.get("episode", 0))
+    saved = int(status.get("saved", 0))
+    target = int(status.get("target", 0))
     if event == RECORD_EVENT_PREVIEW:
         logger_mp.info("[RecordManager] Preview started. Teleop enabled without recording.")
     elif event == RECORD_EVENT_STARTED:
@@ -155,9 +123,9 @@ def log_record_status_if_updated(arm_ctrl):
         logger_mp.info(
             "Recorder saved episode %06d with %d command samples, %d robot states and %d camera frames.",
             episode,
-            status["command_samples"],
-            status["robot_states"],
-            status["camera_frames"],
+            int(status.get("command_samples", 0)),
+            int(status.get("robot_states", 0)),
+            int(status.get("camera_frames", 0)),
         )
         logger_mp.info(
             "[RecordManager] Episode %06d kept (%d/%d saved).",
@@ -214,12 +182,51 @@ def build_parser():
     parser.add_argument("--orientation-scale-ry", type=float, default=-1.0)
     parser.add_argument("--orientation-scale-rz", type=float, default=1.0)
     parser.add_argument(
+        "--record-host",
+        type=str,
+        default=CTRL_HOST,
+        help="Control host IP for ZMQ record commands/status when --record-zmq-mode=control-bind.",
+    )
+    parser.add_argument(
+        "--record-zmq-mode",
+        type=str,
+        choices=["control-bind", "teleop-bind"],
+        default="teleop-bind",
+        help="control-bind: bridge binds and teleop connects. teleop-bind: teleop binds and bridge connects.",
+    )
+    parser.add_argument("--record-bind-host", type=str, default="0.0.0.0")
+    parser.add_argument("--record-cmd-port", type=int, default=5587)
+    parser.add_argument("--record-status-port", type=int, default=5588)
+    parser.add_argument(
+        "--record-probe-timeout",
+        type=float,
+        default=1.0,
+        help="TCP probe timeout for record ZMQ ports. Set <=0 to disable.",
+    )
+    parser.add_argument(
         "--ik-translation-fallback-threshold",
         type=float,
         default=0.02,
         help="Fallback to position-priority IK when full-pose IK translation error is too large.",
     )
     return parser
+
+
+def probe_tcp_port(host: str, port: int, timeout_sec: float) -> bool:
+    if timeout_sec <= 0.0:
+        return True
+    try:
+        with socket.create_connection((host, int(port)), timeout=float(timeout_sec)):
+            return True
+    except OSError as exc:
+        logger_mp.warning(
+            "[record-zmq] TCP probe failed host=%s port=%d timeout=%.2fs error=%s",
+            host,
+            int(port),
+            float(timeout_sec),
+            exc,
+        )
+        return False
 
 
 def setup_input_listener(args):
@@ -528,13 +535,6 @@ def drive_home_before_exit(arm_ctrl, timeout_sec: float = 8.0, tolerance: float 
 
 def cleanup(args, arm_ctrl, ipc_server, keyboard_thread, tv_wrapper):
     try:
-        if arm_ctrl is not None:
-            arm_ctrl.set_record_command(RECORD_CMD_ABORT)
-            time.sleep(0.1)
-    except Exception as exc:
-        logger_mp.error("Failed to send record abort command: %s", exc)
-
-    try:
         if args.ipc and ipc_server is not None:
             ipc_server.stop()
         else:
@@ -562,6 +562,7 @@ def main():
     keyboard_thread = None
     tv_wrapper = None
     arm_ctrl = None
+    record_client = None
 
     try:
         initialize_channel(args)
@@ -575,6 +576,37 @@ def main():
             simulation_mode=args.sim,
             enable_command_stream=True,
         )
+        if args.record_zmq_mode == "teleop-bind":
+            logger_mp.info(
+                "[record-zmq] teleop bind cmd=tcp://%s:%d status=tcp://%s:%d",
+                args.record_bind_host,
+                args.record_cmd_port,
+                args.record_bind_host,
+                args.record_status_port,
+            )
+            record_client = RecordCmdClient(
+                ctrl_host=None,
+                cmd_port=args.record_cmd_port,
+                status_port=args.record_status_port,
+                bind=True,
+                bind_host=args.record_bind_host,
+            )
+        else:
+            logger_mp.info(
+                "[record-zmq] target cmd=tcp://%s:%d status=tcp://%s:%d",
+                args.record_host,
+                args.record_cmd_port,
+                args.record_host,
+                args.record_status_port,
+            )
+            probe_tcp_port(args.record_host, args.record_cmd_port, args.record_probe_timeout)
+            probe_tcp_port(args.record_host, args.record_status_port, args.record_probe_timeout)
+            record_client = RecordCmdClient(
+                ctrl_host=args.record_host,
+                cmd_port=args.record_cmd_port,
+                status_port=args.record_status_port,
+            )
+        logger_mp.info("[record-zmq] client initialized.")
 
         robot_origin_pose = arm_ik.fk(np.deg2rad(DUCO_HOME_Q_DEG))
         if args.affinity:
@@ -599,8 +631,9 @@ def main():
             loop_start = time.time()
             record_cmd = pop_record_command()
             if record_cmd != RECORD_CMD_NOOP:
-                arm_ctrl.set_record_command(record_cmd)
-            log_record_status_if_updated(arm_ctrl)
+                seq = record_client.send_cmd(record_cmd)
+                logger_mp.info("[record-zmq] sent cmd=%d seq=%s host=%s", record_cmd, seq, args.record_host)
+            _drain_record_status(record_client)
 
             if EXIT_REQUESTED:
                 drive_home_before_exit(arm_ctrl)
@@ -651,6 +684,13 @@ def main():
 
         logger_mp.error(traceback.format_exc())
     finally:
+        if record_client is not None:
+            try:
+                record_client.send_cmd(RECORD_CMD_ABORT)
+                time.sleep(0.05)
+                record_client.close()
+            except Exception as exc:
+                logger_mp.error("Failed to close record ZMQ client cleanly: %s", exc)
         cleanup(args, arm_ctrl, ipc_server, keyboard_thread, tv_wrapper)
         logger_mp.info("Exiting teleop_arm_visionpro.")
         sys.exit(0)
