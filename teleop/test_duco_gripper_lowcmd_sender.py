@@ -45,6 +45,7 @@ RECORD_CMD_KEEP = 2
 RECORD_CMD_DISCARD = 3
 RECORD_CMD_SKIP_RESET = 4
 RECORD_CMD_ABORT = 5
+RECORD_CMD_PREVIEW = 6
 
 PINCH_NORMALIZED_MIN_CM = 1.0
 PINCH_NORMALIZED_MAX_CM = 5.0
@@ -129,6 +130,15 @@ def send_msg(publisher, msg, dry_run: bool) -> None:
         publisher.Write(msg)
 
 
+def send_record_command(args, publisher, crc: CRC, record_cmd: int, gripper_target: float = 0.0) -> None:
+    period = 1.0 / max(args.hz, 1e-6)
+    hold_count = max(1, int(math.ceil(args.record_cmd_hold_sec * args.hz)))
+    for _ in range(hold_count):
+        msg = make_lowcmd(args.joint_q, gripper_target, record_cmd, crc)
+        send_msg(publisher, msg, args.dry_run)
+        time.sleep(period)
+
+
 def run_episode(args, publisher, crc: CRC, episode_index: int) -> None:
     sample_count = max(1, int(round(args.episode_seconds * args.hz)))
     period = 1.0 / max(args.hz, 1e-6)
@@ -153,11 +163,7 @@ def run_episode(args, publisher, crc: CRC, episode_index: int) -> None:
         time.sleep(max(0.0, period - elapsed))
 
     finish_cmd = RECORD_CMD_DISCARD if args.discard else RECORD_CMD_KEEP
-    hold_count = max(1, int(math.ceil(args.record_cmd_hold_sec * args.hz)))
-    for _ in range(hold_count):
-        msg = make_lowcmd(args.joint_q, gripper_target, finish_cmd, crc)
-        send_msg(publisher, msg, args.dry_run)
-        time.sleep(period)
+    send_record_command(args, publisher, crc, finish_cmd, gripper_target=gripper_target)
 
     print(
         f"episode={episode_index:03d} finished save={not args.discard} "
@@ -178,30 +184,33 @@ def run(args) -> None:
     crc = None if CRC is None else CRC()
     print(f"topic={topic} dry_run={args.dry_run} hz={args.hz} episodes={args.episodes}")
 
+    if args.send_preview:
+        print("sending PREVIEW command before episodes")
+        send_record_command(args, publisher, crc, RECORD_CMD_PREVIEW, gripper_target=0.0)
+
     for episode_index in range(args.episodes):
         run_episode(args, publisher, crc, episode_index)
         if episode_index < args.episodes - 1:
-            msg = make_lowcmd(args.joint_q, 0.0, RECORD_CMD_SKIP_RESET, crc)
-            send_msg(publisher, msg, args.dry_run)
+            send_record_command(args, publisher, crc, RECORD_CMD_SKIP_RESET, gripper_target=0.0)
             time.sleep(max(0.0, args.reset_pause_sec))
 
     if args.abort_at_end:
-        msg = make_lowcmd(args.joint_q, 0.0, RECORD_CMD_ABORT, crc)
-        send_msg(publisher, msg, args.dry_run)
+        send_record_command(args, publisher, crc, RECORD_CMD_ABORT, gripper_target=0.0)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--network-interface", type=str, default="wlp4s0")
-    parser.add_argument("--peer-address", type=str, default="10.138.41.147")
+    parser.add_argument("--network-interface", type=str, default="enp0s31f6")
+    parser.add_argument("--peer-address", type=str, default="10.188.223.119")
     parser.add_argument("--motion", action="store_true", help="publish to rt/arm_sdk instead of rt/lowcmd")
     parser.add_argument("--hz", type=float, default=30.0)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--episode-seconds", type=float, default=8.0)
     parser.add_argument("--wave-period", type=float, default=2.0)
     parser.add_argument("--reset-pause-sec", type=float, default=0.5)
-    parser.add_argument("--record-cmd-hold-sec", type=float, default=0.25)
+    parser.add_argument("--record-cmd-hold-sec", type=float, default=0.10)
     parser.add_argument("--joint-q", type=parse_joint_q, default=[0.0] * ARM_DOF)
+    parser.add_argument("--send-preview", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--discard", action="store_true", help="send DISCARD instead of KEEP")
     parser.add_argument("--abort-at-end", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="print encode/decode data without DDS publish")

@@ -201,7 +201,7 @@ def build_parser():
     parser.add_argument(
         "--position-scale",
         type=float,
-        default=0.8,
+        default=1.0,
         help="Scale factor for teleop translation delta.",
     )
     parser.add_argument(
