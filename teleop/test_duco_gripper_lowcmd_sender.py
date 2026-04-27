@@ -181,7 +181,15 @@ def run(args) -> None:
         publisher.Init()
 
     crc = None if CRC is None else CRC()
-    record_client = None if args.dry_run else RecordCmdClient(ctrl_host=args.record_host)
+    record_client = None
+    if not args.dry_run:
+        record_client = RecordCmdClient(
+            ctrl_host=None if args.record_zmq_mode == "teleop-bind" else args.record_host,
+            cmd_port=args.record_cmd_port,
+            status_port=args.record_status_port,
+            bind=args.record_zmq_mode == "teleop-bind",
+            bind_host=args.record_bind_host,
+        )
     print(f"topic={topic} dry_run={args.dry_run} hz={args.hz} episodes={args.episodes}")
 
     try:
@@ -207,6 +215,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network-interface", type=str, default="enp0s31f6")
     parser.add_argument("--peer-address", type=str, default="10.188.223.119")
     parser.add_argument("--record-host", type=str, default="10.188.223.119")
+    parser.add_argument("--record-zmq-mode", choices=("control-bind", "teleop-bind"), default="control-bind")
+    parser.add_argument("--record-bind-host", type=str, default="0.0.0.0")
+    parser.add_argument("--record-cmd-port", type=int, default=5587)
+    parser.add_argument("--record-status-port", type=int, default=5588)
     parser.add_argument("--motion", action="store_true", help="publish to rt/arm_sdk instead of rt/lowcmd")
     parser.add_argument("--hz", type=float, default=30.0)
     parser.add_argument("--episodes", type=int, default=3)
