@@ -1,4 +1,5 @@
 import argparse
+from collections import deque
 import os
 import sys
 import threading
@@ -28,21 +29,69 @@ from teleop.utils.motion_switcher import MotionSwitcher
 START = False
 STOP = False
 READY = False
+EXIT_REQUESTED = False
+PENDING_RECORD_CMDS = deque()
+RECORD_CMD_LOCK = threading.Lock()
+
+RECORD_CMD_NOOP = 0
+RECORD_CMD_START = 1
+RECORD_CMD_KEEP = 2
+RECORD_CMD_DISCARD = 3
+RECORD_CMD_SKIP_RESET = 4
+RECORD_CMD_ABORT = 5
+RECORD_CMD_PREVIEW = 6
+RECORD_STATUS_MAGIC = 0x41565052
+RECORD_EVENT_PREVIEW = 1
+RECORD_EVENT_STARTED = 2
+RECORD_EVENT_KEPT = 3
+RECORD_EVENT_DISCARDED = 4
+RECORD_EVENT_RESET_SKIPPED = 5
+RECORD_EVENT_ABORTED = 6
+RECORD_EVENT_TARGET_REACHED = 7
+
+LAST_RECORD_STATUS_SEQ = None
 
 REAL_CHANNEL_INTERFACE = "enp0s31f6"
 REAL_CHANNEL_PEER_ADDRESS = "10.188.223.119"
-VISION_PRO_IP = "10.188.211.82"
+VISION_PRO_IP = "10.188.215.239"
 DUCO_URDF_PATH = "/home/yofo/unitree/duco_support/urdf/duco_gcr5_910.urdf"
 DUCO_HOME_Q_DEG = np.array([-8.25, -23.15, 121.49, 82.65, 81.61, 4.47], dtype=np.float64)
 
 
+def queue_record_command(record_cmd: int):
+    with RECORD_CMD_LOCK:
+        PENDING_RECORD_CMDS.append(int(record_cmd))
+
+
+def pop_record_command() -> int:
+    with RECORD_CMD_LOCK:
+        if PENDING_RECORD_CMDS:
+            return PENDING_RECORD_CMDS.popleft()
+    return RECORD_CMD_NOOP
+
+
 def on_press(key):
-    global START, STOP
+    global START, STOP, EXIT_REQUESTED
     if key == "r":
         START = True
+        queue_record_command(RECORD_CMD_PREVIEW)
+    elif key == "e":
+        START = True
+        queue_record_command(RECORD_CMD_ABORT)
+        queue_record_command(RECORD_CMD_PREVIEW)
+    elif key == "s":
+        queue_record_command(RECORD_CMD_START)
+    elif key == "right":
+        queue_record_command(RECORD_CMD_KEEP)
+    elif key == "left":
+        queue_record_command(RECORD_CMD_DISCARD)
+    elif key == "space":
+        queue_record_command(RECORD_CMD_SKIP_RESET)
     elif key == "q":
-        START = False
-        STOP = True
+        if START:
+            EXIT_REQUESTED = True
+        else:
+            STOP = True
     else:
         logger_mp.warning("Ignored input key: %s", key)
 
@@ -50,6 +99,86 @@ def on_press(key):
 def get_state() -> dict:
     global START, STOP, READY
     return {"START": START, "STOP": STOP, "READY": READY}
+
+
+def _decode_record_status_counts(raw_counts: int):
+    command_samples = int(raw_counts) & 0xFFF
+    robot_states = (int(raw_counts) >> 12) & 0x3FF
+    camera_frames = (int(raw_counts) >> 22) & 0x3FF
+    return command_samples, robot_states, camera_frames
+
+
+def decode_record_status_payload(payload):
+    if payload is None or len(payload) < 4:
+        return None
+    if int(payload[0]) != RECORD_STATUS_MAGIC:
+        return None
+
+    header = int(payload[1])
+    if header == 0:
+        return None
+
+    progress = int(payload[2])
+    command_samples, robot_states, camera_frames = _decode_record_status_counts(payload[3])
+    return {
+        "seq": (header >> 16) & 0xFFFF,
+        "event": (header >> 8) & 0xFF,
+        "state": header & 0xFF,
+        "episode": (progress >> 16) & 0xFFFF,
+        "saved": (progress >> 8) & 0xFF,
+        "target": progress & 0xFF,
+        "command_samples": command_samples,
+        "robot_states": robot_states,
+        "camera_frames": camera_frames,
+    }
+
+
+def log_record_status_if_updated(arm_ctrl):
+    global LAST_RECORD_STATUS_SEQ
+    if arm_ctrl is None:
+        return
+    status = decode_record_status_payload(arm_ctrl.get_record_status_payload())
+    if status is None or status["seq"] == LAST_RECORD_STATUS_SEQ:
+        return
+    LAST_RECORD_STATUS_SEQ = status["seq"]
+
+    event = status["event"]
+    episode = status["episode"]
+    saved = status["saved"]
+    target = status["target"]
+    if event == RECORD_EVENT_PREVIEW:
+        logger_mp.info("[RecordManager] Preview started. Teleop enabled without recording.")
+    elif event == RECORD_EVENT_STARTED:
+        logger_mp.info("Recorder started episode %06d task=duco_teleop", episode)
+        logger_mp.info("[RecordManager] Episode %06d started (%d/%d saved).", episode, saved, target)
+    elif event == RECORD_EVENT_KEPT:
+        logger_mp.info(
+            "Recorder saved episode %06d with %d command samples, %d robot states and %d camera frames.",
+            episode,
+            status["command_samples"],
+            status["robot_states"],
+            status["camera_frames"],
+        )
+        logger_mp.info(
+            "[RecordManager] Episode %06d kept (%d/%d saved).",
+            episode,
+            saved,
+            target,
+        )
+    elif event == RECORD_EVENT_DISCARDED:
+        logger_mp.info("Recorder discarded episode %06d before save.", episode)
+        logger_mp.info(
+            "[RecordManager] Episode %06d discarded (%d/%d saved).",
+            episode,
+            saved,
+            target,
+        )
+    elif event == RECORD_EVENT_RESET_SKIPPED:
+        logger_mp.info("[RecordManager] Reset skipped by operator.")
+    elif event == RECORD_EVENT_ABORTED:
+        logger_mp.info("[RecordManager] Aborted. Saved %d/%d episodes.", saved, target)
+    elif event == RECORD_EVENT_TARGET_REACHED:
+        logger_mp.info("[RecordManager] Target %d episodes reached, back to idle.", target)
 
 
 def build_parser():
@@ -339,6 +468,9 @@ def log_run_config(args, robot_origin_pose):
     logger_mp.info("----------------------------------------------------------------")
     logger_mp.info("🟢 Press [r] to start syncing the robot with your movements.")
     logger_mp.info("🔴 Press [q] to stop and exit the program.")
+    logger_mp.info("[record idle] Press [s] to start a capture run, [e] to return to preview.")
+    logger_mp.info("[recording] Press [right] to keep, [left] to discard.")
+    logger_mp.info("[record reset] Press [space] to skip reset.")
     logger_mp.info("⚠️ Keep safe!")
     logger_mp.info(
         "Mode summary: sim=%s motion=%s hand=%s orientation=%s position_scale=%.3f orientation_scale=%.3f",
@@ -368,12 +500,39 @@ def wait_for_start_signal():
         time.sleep(0.033)
 
 
+def drive_home_before_exit(arm_ctrl, timeout_sec: float = 8.0, tolerance: float = 0.05):
+    if arm_ctrl is None:
+        return
+
+    home_q = np.zeros(6, dtype=np.float64) if arm_ctrl.simulation_mode else np.deg2rad(DUCO_HOME_Q_DEG)
+    tauff = np.zeros_like(home_q)
+    gripper_target = getattr(arm_ctrl, "gripper_target", 0.0)
+    logger_mp.info("[duco_ArmController] Sending home target before exit.")
+
+    try:
+        arm_ctrl.speed_instant_max()
+    except Exception:
+        pass
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline and not STOP:
+        arm_ctrl.ctrl_arm(home_q, tauff, gripper_target=gripper_target)
+        current_q = arm_ctrl.get_current_arm_q()
+        if np.all(np.abs(current_q - home_q) < tolerance):
+            logger_mp.info("[duco_ArmController] arm has reached the home position before exit.")
+            return
+        time.sleep(0.05)
+
+    logger_mp.warning("[duco_ArmController] home-before-exit timeout.")
+
+
 def cleanup(args, arm_ctrl, ipc_server, keyboard_thread, tv_wrapper):
     try:
         if arm_ctrl is not None:
-            arm_ctrl.ctrl_dual_arm_go_home()
+            arm_ctrl.set_record_command(RECORD_CMD_ABORT)
+            time.sleep(0.1)
     except Exception as exc:
-        logger_mp.error("Failed to send go-home command: %s", exc)
+        logger_mp.error("Failed to send record abort command: %s", exc)
 
     try:
         if args.ipc and ipc_server is not None:
@@ -393,7 +552,7 @@ def cleanup(args, arm_ctrl, ipc_server, keyboard_thread, tv_wrapper):
 
 
 def main():
-    global STOP
+    global STOP, EXIT_REQUESTED
 
     parser = build_parser()
     args = parser.parse_args()
@@ -438,6 +597,15 @@ def main():
         missing_pose_warn_ts = 0.0
         while not STOP:
             loop_start = time.time()
+            record_cmd = pop_record_command()
+            if record_cmd != RECORD_CMD_NOOP:
+                arm_ctrl.set_record_command(record_cmd)
+            log_record_status_if_updated(arm_ctrl)
+
+            if EXIT_REQUESTED:
+                drive_home_before_exit(arm_ctrl)
+                STOP = True
+                break
 
             tele_data = tv_wrapper.get_tele_data()
             current_tele_pose = get_target_pose(tele_data, args.hand_side)
@@ -467,7 +635,11 @@ def main():
                 current_arm_dq,
                 target_pose,
             )
-            arm_ctrl.ctrl_arm(sol_q, sol_tauff, gripper_target=pinch_normalized)
+            arm_ctrl.ctrl_arm(
+                sol_q,
+                sol_tauff,
+                gripper_target=pinch_normalized,
+            )
 
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, (1.0 / args.frequency) - elapsed))
