@@ -23,3 +23,8 @@ teleop/data/
 episode_0*
 .vscode/
 *.pkl
+# Public project presentation assets
+!media/logo.png
+!media/architecture.png
+!media/duco.png
+!media/duco-teleop-demo.mp4
